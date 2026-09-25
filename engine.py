@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           ROOT BROWSER v5.0 — FULL FEATURED                  ║
-║           Tor (auto) · Privacy · Security Tools · Legal      ║
+║           ROOT BROWSER v6.0 — FULL FEATURED + UPDATER        ║
+║           Tor · Privacy · Security Tools · Legal · Update    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 import sys, os, re, json, time, random, socket, hashlib, sqlite3
@@ -21,29 +21,53 @@ from PyQt5.QtWidgets import (
     QShortcut, QMenu, QListWidget, QListWidgetItem, QComboBox,
     QFileDialog, QInputDialog, QDialogButtonBox, QGroupBox,
     QCheckBox, QSplitter, QTreeWidget, QTreeWidgetItem, QSpinBox,
-    QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView
+    QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView,
+    QFormLayout
 )
 from PyQt5.QtWebEngineWidgets import (
     QWebEngineView, QWebEngineProfile, QWebEngineSettings,
     QWebEngineDownloadItem, QWebEnginePage
 )
 from PyQt5.QtWebEngineCore import QWebEngineUrlRequestInterceptor
+from PyQt5.QtNetwork import QNetworkCookie
 
 
 # ============================================================
-#  LICENSE IMPORT (graceful fallback)
+#  LICENSE IMPORT
 # ============================================================
 try:
-    from licence import LicenseDialog, show_license, request_acceptance
+    from licence import (
+        LicenseDialog, show_license, request_acceptance,
+        warning_sql_scanner, warning_hash_cracker,
+        warning_dark_search, warning_request_repeater
+    )
     LICENSE_AVAILABLE = True
 except ImportError:
     LICENSE_AVAILABLE = False
-    def show_license(parent=None):
-        QMessageBox.information(parent, "License",
-            "licence.py not found in the same folder.\n"
-            "See LICENSE file for details.")
-    def request_acceptance(parent=None):
-        return True
+    def show_license(parent=None): pass
+    def request_acceptance(parent=None): return True
+    def warning_sql_scanner(parent=None): return True
+    def warning_hash_cracker(parent=None): return True
+    def warning_dark_search(parent=None): return True
+    def warning_request_repeater(parent=None): return True
+
+
+# ============================================================
+#  UPDATER IMPORT
+# ============================================================
+try:
+    from updater import (
+        check_for_updates, check_for_updates_manual,
+        open_updater_config, get_current_version,
+        UpdateChecker
+    )
+    UPDATER_AVAILABLE = True
+except ImportError:
+    UPDATER_AVAILABLE = False
+    def check_for_updates(parent=None, silent=True): pass
+    def check_for_updates_manual(parent=None): pass
+    def open_updater_config(parent=None): pass
+    def get_current_version(): return "5.0.0"
 
 
 # ============================================================
@@ -53,15 +77,12 @@ class Config:
     TOR_SOCKS_PORT = 9050
     TOR_CONTROL_PORT = 9051
     MAX_TABS = 15
-
-    # "auto" = Tor mile toh use karo, warna direct
-    # True   = sirf Tor (Tor na ho toh error)
-    # False  = sirf direct connection
     USE_TOR = "auto"
-
     TOR_AUTO_START = False
     TOR_EXE_PATH = r"C:\tor\tor.exe"
     _TOR_AVAILABLE = False
+
+    HOMEPAGE = ""  # Empty = default built-in page
 
     SEARCH_ENGINES = {
         "DuckDuckGo": "https://duckduckgo.com/?q={}",
@@ -89,6 +110,27 @@ class Config:
         "Tor Browser": "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0",
         "Edge (Win)": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
     }
+
+
+CONFIG_FILE = Path(__file__).parent / "user_config.json"
+
+
+def load_user_config():
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_user_config(data):
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -234,7 +276,7 @@ class RequestInterceptor(QWebEngineUrlRequestInterceptor):
 
 
 # ============================================================
-#  TOR MANAGER (auto-detect)
+#  TOR MANAGER
 # ============================================================
 class TorManager:
     def __init__(self):
@@ -277,13 +319,6 @@ class TorManager:
         except Exception:
             return False
 
-    def wait_for_tor(self, timeout=30):
-        for _ in range(timeout):
-            if self.is_running():
-                return True
-            time.sleep(1)
-        return False
-
     def renew_circuit(self):
         try:
             from stem import Signal
@@ -310,19 +345,162 @@ class TorManager:
             r = requests.get(
                 "https://check.torproject.org/api/ip",
                 proxies={'http': f'socks5h://127.0.0.1:{self.socks_port}',
-                         'https': f'socks5h://127.0.0.1:{self.socks_port}'},
+                         'https': f'socksh://127.0.0.1:{self.socks_port}'},
                 timeout=timeout)
             data = r.json()
             return data.get('IP'), data.get('IsTor', False)
         except Exception:
             return None, False
 
-    def stop_tor(self):
-        if self._tor_process:
-            try:
-                self._tor_process.terminate()
-            except Exception:
-                pass
+
+# ============================================================
+#  SESSION MANAGER (SQLite)
+# ============================================================
+class SessionManager:
+    def __init__(self, db_path="sessions.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT, title TEXT,
+                visit_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE, title TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def add_history(self, url, title):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("INSERT INTO history (url, title) VALUES (?, ?)",
+                      (url, title))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def get_history(self, limit=500):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("SELECT url, title, visit_time FROM history "
+                      "ORDER BY visit_time DESC LIMIT ?", (limit,))
+            rows = c.fetchall()
+            conn.close()
+            return rows
+        except Exception:
+            return []
+
+    def add_bookmark(self, url, title):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO bookmarks (url, title) "
+                      "VALUES (?, ?)", (url, title))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def get_bookmarks(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("SELECT url, title FROM bookmarks ORDER BY created_at DESC")
+            rows = c.fetchall()
+            conn.close()
+            return rows
+        except Exception:
+            return []
+
+
+# ============================================================
+#  PASSWORD MANAGER (Fernet encrypted)
+# ============================================================
+class PasswordManager:
+    def __init__(self):
+        self.passwords = {}
+        self.pass_file = Path("passwords.enc")
+        self.key_file = Path(".pm_key")
+        self._fernet = None
+        self._init_crypto()
+        self._load()
+
+    def _init_crypto(self):
+        try:
+            from cryptography.fernet import Fernet
+            if self.key_file.exists():
+                key = self.key_file.read_bytes()
+            else:
+                key = Fernet.generate_key()
+                try:
+                    self.key_file.write_bytes(key)
+                except Exception:
+                    pass
+            self._fernet = Fernet(key)
+        except ImportError:
+            self._fernet = None
+
+    def _encrypt(self, data):
+        if self._fernet:
+            return self._fernet.encrypt(data)
+        return base64.b64encode(data)
+
+    def _decrypt(self, data):
+        if self._fernet:
+            return self._fernet.decrypt(data)
+        return base64.b64decode(data)
+
+    def _load(self):
+        if not self.pass_file.exists():
+            return
+        try:
+            raw = self.pass_file.read_bytes()
+            dec = self._decrypt(raw)
+            self.passwords = json.loads(dec.decode('utf-8'))
+        except Exception:
+            self.passwords = {}
+
+    def _save(self):
+        try:
+            raw = json.dumps(self.passwords).encode('utf-8')
+            enc = self._encrypt(raw)
+            self.pass_file.write_bytes(enc)
+        except Exception:
+            pass
+
+    def add(self, url, username, password):
+        if url not in self.passwords:
+            self.passwords[url] = []
+        for e in self.passwords[url]:
+            if e['username'] == username:
+                e['password'] = password
+                self._save()
+                return
+        self.passwords[url].append({'username': username,
+                                    'password': password})
+        self._save()
+
+    def get_all(self):
+        return self.passwords
+
+    def delete(self, url, username):
+        if url in self.passwords:
+            self.passwords[url] = [e for e in self.passwords[url]
+                                   if e['username'] != username]
+            if not self.passwords[url]:
+                del self.passwords[url]
+            self._save()
 # ============================================================
 #  HASH CRACKER
 # ============================================================
@@ -388,7 +566,7 @@ class CrackWorker(QThread):
 class HashCrackerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Hash Cracker")
+        self.setWindowTitle("🔐 Hash Cracker")
         self.setMinimumSize(600, 500)
         l = QVBoxLayout()
         l.addWidget(QLabel("Hash:"))
@@ -418,7 +596,7 @@ class HashCrackerDialog(QDialog):
         bl.addWidget(self.s)
         self.st = QPushButton("Stop")
         self.st.setEnabled(False)
-        self.st.clicked.connect(self.stop)
+        self.st.clicked.connect(self.stop_crack)
         bl.addWidget(self.st)
         l.addLayout(bl)
         self.p = QProgressBar()
@@ -428,7 +606,7 @@ class HashCrackerDialog(QDialog):
         self.o.setReadOnly(True)
         l.addWidget(self.o)
         cb = QDialogButtonBox(QDialogButtonBox.Close)
-        cb.rejected.connect(self.reject)
+        cb.rejected.connect(self.close_me)
         l.addWidget(cb)
         self.setLayout(l)
         self.worker = None
@@ -452,14 +630,16 @@ class HashCrackerDialog(QDialog):
         self.o.clear()
         self.s.setEnabled(False)
         self.st.setEnabled(True)
-        self.worker = CrackWorker(self.h.text(), self.t.currentText(), self.w.text())
+        self.worker = CrackWorker(self.h.text(), self.t.currentText(),
+                                  self.w.text())
         self.worker.progress.connect(self.upd)
         self.worker.finished.connect(self.done)
         self.worker.error.connect(self.err)
         self.worker.start()
 
-    def stop(self):
-        if self.worker: self.worker.stop()
+    def stop_crack(self):
+        if self.worker:
+            self.worker.stop()
 
     def upd(self, c, t):
         self.p.setMaximum(max(1, t))
@@ -475,6 +655,12 @@ class HashCrackerDialog(QDialog):
         QMessageBox.critical(self, "Error", e)
         self.s.setEnabled(True)
         self.st.setEnabled(False)
+
+    def close_me(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(2000)
+        self.reject()
 
 
 # ============================================================
@@ -503,7 +689,7 @@ class SqlWorker(QThread):
             total = len(self.p) * len(self.PAYLOADS)
             c = 0
             px = None
-            if Config.USE_TOR:
+            if Config.USE_TOR is True or Config._TOR_AVAILABLE:
                 px = {'http': 'socks5h://127.0.0.1:9050',
                       'https': 'socks5h://127.0.0.1:9050'}
             s = requests.Session()
@@ -519,19 +705,24 @@ class SqlWorker(QThread):
                         if self.m == 'GET':
                             parsed = urlparse(self.u)
                             q = parse_qs(parsed.query)
-                            if p not in q: continue
+                            if p not in q:
+                                continue
                             base = s.get(self.u, timeout=10)
                             nq = q.copy()
                             nq[p] = [pl]
-                            inj = urlunparse(parsed._replace(query=urlencode(nq, doseq=True)))
+                            inj = urlunparse(parsed._replace(
+                                query=urlencode(nq, doseq=True)))
                             r = s.get(inj, timeout=10)
                         else:
-                            base = s.post(self.u, data={x: '1' for x in self.p}, timeout=10)
+                            base = s.post(self.u,
+                                          data={x: '1' for x in self.p},
+                                          timeout=10)
                             d = {x: '1' for x in self.p}
                             d[p] = pl
                             r = s.post(self.u, data=d, timeout=10)
-                        sigs = ["sql syntax", "mysql", "postgresql", "syntax error",
-                                "unclosed", "sqlexception", "database error"]
+                        sigs = ["sql syntax", "mysql", "postgresql",
+                                "syntax error", "unclosed",
+                                "sqlexception", "database error"]
                         if any(sig in r.text.lower() for sig in sigs):
                             self.found.emit(p, pl, self.m, "Error-based")
                         elif abs(len(r.content) - len(base.content)) > 200:
@@ -550,7 +741,7 @@ class SqlWorker(QThread):
 class SqlScannerDialog(QDialog):
     def __init__(self, url='', parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SQL Scanner")
+        self.setWindowTitle("💉 SQL Scanner")
         self.setMinimumSize(700, 600)
         l = QVBoxLayout()
         l.addWidget(QLabel("Target URL:"))
@@ -574,7 +765,7 @@ class SqlScannerDialog(QDialog):
         bl.addWidget(self.s)
         self.st = QPushButton("Stop")
         self.st.setEnabled(False)
-        self.st.clicked.connect(self.stop)
+        self.st.clicked.connect(self.stop_scan)
         bl.addWidget(self.st)
         l.addLayout(bl)
         self.pb = QProgressBar()
@@ -584,7 +775,7 @@ class SqlScannerDialog(QDialog):
         self.o.setReadOnly(True)
         l.addWidget(self.o)
         cb = QDialogButtonBox(QDialogButtonBox.Close)
-        cb.rejected.connect(self.reject)
+        cb.rejected.connect(self.close_me)
         l.addWidget(cb)
         self.setLayout(l)
         self.worker = None
@@ -612,8 +803,9 @@ class SqlScannerDialog(QDialog):
         self.worker.error.connect(self.err)
         self.worker.start()
 
-    def stop(self):
-        if self.worker: self.worker.stop()
+    def stop_scan(self):
+        if self.worker:
+            self.worker.stop()
 
     def upd(self, c, t):
         self.pb.setMaximum(max(1, t))
@@ -632,6 +824,12 @@ class SqlScannerDialog(QDialog):
         self.s.setEnabled(True)
         self.st.setEnabled(False)
 
+    def close_me(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(2000)
+        self.reject()
+
 
 # ============================================================
 #  REQUEST REPEATER
@@ -648,7 +846,7 @@ class ReqWorker(QThread):
         try:
             import requests
             px = None
-            if Config.USE_TOR:
+            if Config.USE_TOR is True or Config._TOR_AVAILABLE:
                 px = {'http': 'socks5h://127.0.0.1:9050',
                       'https': 'socks5h://127.0.0.1:9050'}
             t0 = time.time()
@@ -666,7 +864,7 @@ class ReqWorker(QThread):
 class RequestRepeaterDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Request Repeater")
+        self.setWindowTitle("🔁 Request Repeater")
         self.setMinimumSize(800, 600)
         l = QVBoxLayout()
         t = QHBoxLayout()
@@ -716,11 +914,11 @@ class RequestRepeaterDialog(QDialog):
         self.w = ReqWorker(self.m.currentText(), u, h,
                            self.b.toPlainText(),
                            self.f.isChecked(), self.v.isChecked())
-        self.w.done.connect(self.show)
+        self.w.done.connect(self.show_res)
         self.w.error.connect(lambda e: self.o.setPlainText(f"Error: {e}"))
         self.w.start()
 
-    def show(self, r):
+    def show_res(self, r):
         h = "\n".join(f"{k}: {v}" for k, v in r['headers'].items())
         self.o.setPlainText(
             f"Status: {r['code']} {r['reason']}\n"
@@ -735,7 +933,7 @@ class DomDialog(QDialog):
     def __init__(self, page, parent=None):
         super().__init__(parent)
         self.page = page
-        self.setWindowTitle("DOM Manipulator")
+        self.setWindowTitle("🧩 DOM Manipulator")
         self.setMinimumSize(800, 600)
         l = QVBoxLayout()
         l.addWidget(QLabel("Edit HTML and click Apply:"))
@@ -762,7 +960,8 @@ class DomDialog(QDialog):
 
     def apply(self):
         html = self.e.toPlainText()
-        js = f"document.open();document.write({json.dumps(html)});document.close();"
+        js = (f"document.open();document.write({json.dumps(html)});"
+              f"document.close();")
         self.page.runJavaScript(js)
         QMessageBox.information(self, "Success", "Applied.")
 
@@ -774,7 +973,7 @@ class DarkSearchDialog(QDialog):
     def __init__(self, browser=None, parent=None):
         super().__init__(parent)
         self.browser = browser
-        self.setWindowTitle("Dark Web Search")
+        self.setWindowTitle("🌐 Dark Web Search")
         self.setMinimumSize(800, 600)
         l = QVBoxLayout()
         t = QHBoxLayout()
@@ -798,15 +997,17 @@ class DarkSearchDialog(QDialog):
         if not q: return
         self.o.clear()
         self.o.append(f"Searching '{q}'...")
+
         def run():
             try:
                 import requests
                 px = None
-                if Config.USE_TOR:
+                if Config.USE_TOR is True or Config._TOR_AVAILABLE:
                     px = {'http': 'socks5h://127.0.0.1:9050',
                           'https': 'socks5h://127.0.0.1:9050'}
-                r = requests.get(f"https://ahmia.fi/search/?q={quote(q)}",
-                                 proxies=px, timeout=20)
+                r = requests.get(
+                    f"https://ahmia.fi/search/?q={quote(q)}",
+                    proxies=px, timeout=20)
                 self.o.append(f"Status: {r.status_code}")
                 try:
                     from bs4 import BeautifulSoup
@@ -814,7 +1015,8 @@ class DarkSearchDialog(QDialog):
                     for res in soup.select('li.result')[:20]:
                         a = res.select_one('h4 a')
                         if a:
-                            self.o.append(f"• {a.get_text(strip=True)}\n  {a.get('href')}")
+                            self.o.append(
+                                f"• {a.get_text(strip=True)}\n  {a.get('href')}")
                 except ImportError:
                     self.o.append(f"HTML: {len(r.text)} chars")
             except Exception as e:
@@ -828,7 +1030,7 @@ class DarkSearchDialog(QDialog):
 class CertDialog(QDialog):
     def __init__(self, hostname=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Certificate Viewer")
+        self.setWindowTitle("📜 Certificate Viewer")
         self.setMinimumSize(700, 500)
         l = QVBoxLayout()
         t = QHBoxLayout()
@@ -876,7 +1078,7 @@ class JsConsole(QDialog):
     def __init__(self, browser, parent=None):
         super().__init__(parent)
         self.browser = browser
-        self.setWindowTitle("JS Console")
+        self.setWindowTitle("JavaScript Console")
         self.setMinimumSize(700, 500)
         l = QVBoxLayout()
         self.o = QTextEdit()
@@ -898,11 +1100,11 @@ class JsConsole(QDialog):
         self.o.append(f"\n> {c}")
         w = self.browser.tabs.currentWidget()
         if isinstance(w, QWebEngineView):
-            w.page().runJavaScript(c, self.show)
+            w.page().runJavaScript(c, self.show_res)
         else:
-            self.show("No page")
+            self.show_res("No page")
 
-    def show(self, r):
+    def show_res(self, r):
         if r is not None:
             self.o.append(f"← {repr(r)}")
 
@@ -942,49 +1144,82 @@ class PyConsole(QDialog):
 
 
 # ============================================================
-#  COOKIE EDITOR
+#  COOKIE EDITOR (real, working)
 # ============================================================
 class CookieEditor(QDialog):
     def __init__(self, profile, parent=None):
         super().__init__(parent)
         self.profile = profile
-        self.setWindowTitle("Cookie Editor")
-        self.setMinimumSize(600, 400)
+        self.setWindowTitle("🍪 Cookie Editor")
+        self.setMinimumSize(600, 450)
         l = QVBoxLayout()
         self.list = QListWidget()
         l.addWidget(self.list)
         bl = QHBoxLayout()
         a = QPushButton("Add")
-        a.clicked.connect(self.add)
+        a.clicked.connect(self.add_cookie)
         bl.addWidget(a)
         d = QPushButton("Delete")
-        d.clicked.connect(self.delete)
+        d.clicked.connect(self.delete_cookie)
         bl.addWidget(d)
         c = QPushButton("Clear All")
-        c.clicked.connect(self.clear)
+        c.clicked.connect(self.clear_cookies)
         bl.addWidget(c)
+        r = QPushButton("Refresh")
+        r.clicked.connect(self.refresh)
+        bl.addWidget(r)
         l.addLayout(bl)
         cb = QDialogButtonBox(QDialogButtonBox.Close)
         cb.rejected.connect(self.reject)
         l.addWidget(cb)
         self.setLayout(l)
-        self.list.addItem("(Cookies clear on close — NoPersistentCookies)")
+        self.refresh()
 
-    def add(self):
-        n, ok = QInputDialog.getText(self, "Cookie", "Name=Value:")
-        if ok and n:
-            self.list.addItem(n)
-
-    def delete(self):
-        i = self.list.currentItem()
-        if i: self.list.takeItem(self.list.row(i))
-
-    def clear(self):
+    def refresh(self):
+        self.list.clear()
         try:
-            self.profile.cookieStore().deleteAllCookies()
+            store = self.profile.cookieStore()
+            store.cookieAdded.connect(self._on_cookie)
         except Exception:
             pass
-        self.list.clear()
+        self.list.addItem("(Cookie store active — NoPersistentCookies)")
+
+    def _on_cookie(self, cookie):
+        try:
+            name = bytes(cookie.name()).decode('utf-8', errors='ignore')
+            domain = cookie.domain()
+            self.list.addItem(f"{domain}  {name}")
+        except Exception:
+            pass
+
+    def add_cookie(self):
+        url, ok = QInputDialog.getText(self, "Cookie URL", "Domain (URL):")
+        if not ok or not url: return
+        n, ok2 = QInputDialog.getText(self, "Cookie Name", "Name:")
+        if not ok2 or not n: return
+        v, ok3 = QInputDialog.getText(self, "Cookie Value", "Value:")
+        if not ok3: return
+        try:
+            c = QNetworkCookie(n.encode(), v.encode())
+            c.setDomain(url.replace("https://", "").replace("http://", "").split("/")[0])
+            self.profile.cookieStore().setCookie(
+                c, QUrl(url if url.startswith("http") else "https://" + url))
+            self.list.addItem(f"SET: {c.domain()} {n}={v}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+
+    def delete_cookie(self):
+        QMessageBox.information(self, "Info",
+                                "Individual cookie deletion coming soon.\n"
+                                "Use Clear All for now.")
+
+    def clear_cookies(self):
+        try:
+            self.profile.cookieStore().deleteAllCookies()
+            self.list.clear()
+            self.list.addItem("(All cookies cleared)")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
 
 
 # ============================================================
@@ -1033,113 +1268,639 @@ class DevToolsWindow(QDialog):
 
 
 # ============================================================
-#  SECURITY SETTINGS
+#  PASSWORD MANAGER DIALOG
 # ============================================================
-class SecuritySettingsDialog(QDialog):
+class PasswordManagerDialog(QDialog):
+    def __init__(self, pm, parent=None):
+        super().__init__(parent)
+        self.pm = pm
+        self.setWindowTitle("🔑 Password Manager")
+        self.setMinimumSize(600, 400)
+        l = QVBoxLayout()
+        self.list = QListWidget()
+        l.addWidget(self.list)
+        bl = QHBoxLayout()
+        a = QPushButton("Add")
+        a.clicked.connect(self.add_pw)
+        bl.addWidget(a)
+        d = QPushButton("Delete")
+        d.clicked.connect(self.del_pw)
+        bl.addWidget(d)
+        bl.addStretch()
+        cb = QDialogButtonBox(QDialogButtonBox.Close)
+        cb.rejected.connect(self.reject)
+        l.addWidget(cb)
+        l.addLayout(bl)
+        self.setLayout(l)
+        self.refresh()
+
+    def refresh(self):
+        self.list.clear()
+        for url, entries in self.pm.get_all().items():
+            for e in entries:
+                item = QListWidgetItem(f"{url}  |  {e['username']}")
+                item.setData(Qt.UserRole, (url, e['username']))
+                self.list.addItem(item)
+
+    def add_pw(self):
+        url, ok1 = QInputDialog.getText(self, "Add", "URL:")
+        if not ok1 or not url: return
+        user, ok2 = QInputDialog.getText(self, "Add", "Username:")
+        if not ok2: return
+        pw, ok3 = QInputDialog.getText(self, "Add", "Password:",
+                                       QLineEdit.Password)
+        if not ok3: return
+        self.pm.add(url, user, pw)
+        self.refresh()
+
+    def del_pw(self):
+        item = self.list.currentItem()
+        if not item: return
+        url, user = item.data(Qt.UserRole)
+        self.pm.delete(url, user)
+        self.refresh()
+
+
+# ============================================================
+#  HISTORY / BOOKMARKS DIALOGS
+# ============================================================
+class HistoryDialog(QDialog):
+    def __init__(self, sessions, parent=None):
+        super().__init__(parent)
+        self.sessions = sessions
+        self.setWindowTitle("📜 History")
+        self.setMinimumSize(700, 500)
+        l = QVBoxLayout()
+        self.list = QListWidget()
+        l.addWidget(self.list)
+        cb = QDialogButtonBox(QDialogButtonBox.Close)
+        cb.rejected.connect(self.reject)
+        l.addWidget(cb)
+        self.setLayout(l)
+        self.load()
+
+    def load(self):
+        self.list.clear()
+        for row in self.sessions.get_history():
+            url, title, when = row
+            item = QListWidgetItem(f"[{str(when)[:19]}] {title or url}")
+            item.setData(Qt.UserRole, url)
+            self.list.addItem(item)
+
+
+class BookmarksDialog(QDialog):
+    def __init__(self, sessions, parent=None):
+        super().__init__(parent)
+        self.sessions = sessions
+        self.setWindowTitle("⭐ Bookmarks")
+        self.setMinimumSize(600, 450)
+        l = QVBoxLayout()
+        self.list = QListWidget()
+        l.addWidget(self.list)
+        cb = QDialogButtonBox(QDialogButtonBox.Close)
+        cb.rejected.connect(self.reject)
+        l.addWidget(cb)
+        self.setLayout(l)
+        self.load()
+
+    def load(self):
+        self.list.clear()
+        for url, title in self.sessions.get_bookmarks():
+            item = QListWidgetItem(f"{title or url}")
+            item.setData(Qt.UserRole, url)
+            self.list.addItem(item)
+
+
+# ============================================================
+#  SETTINGS DIALOG (NEW — with Check Updates)
+# ============================================================
+class SettingsDialog(QDialog):
     def __init__(self, browser, parent=None):
         super().__init__(parent)
         self.browser = browser
-        self.setWindowTitle("Security Settings")
-        self.setMinimumSize(500, 400)
-        l = QVBoxLayout()
+        self.setWindowTitle("⚙️  Settings")
+        self.setMinimumSize(720, 620)
+        self.setStyleSheet("""
+            QDialog { background-color: #0f0f1a; }
+            QLabel { color: #e2e8f0; }
+            QGroupBox {
+                color: #6366f1;
+                border: 1px solid #3f3f5e;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }
+            QLineEdit, QComboBox, QSpinBox {
+                background-color: #2d2d4a;
+                color: #f1f5f9;
+                border: 1px solid #4b4b6e;
+                border-radius: 6px;
+                padding: 6px 10px;
+            }
+            QCheckBox { color: #e2e8f0; spacing: 8px; }
+            QPushButton {
+                background-color: #3a3a5e;
+                color: #e2e8f0;
+                border: 1px solid #4b4b6e;
+                border-radius: 8px;
+                padding: 8px 18px;
+            }
+            QPushButton:hover { background-color: #4b4b6e; }
+            QListWidget {
+                background-color: #1e1e32; color: #e2e8f0;
+                border: 1px solid #3f3f5e; border-radius: 6px;
+            }
+        """)
 
-        g1 = QGroupBox("SSL/TLS")
-        v1 = QVBoxLayout()
-        self.ssl = QCheckBox("Verify SSL Certificates")
-        self.ssl.setChecked(True)
-        v1.addWidget(self.ssl)
-        g1.setLayout(v1)
+        layout = QVBoxLayout()
+
+        # Tab widget for settings categories
+        tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #3f3f5e;
+                background-color: #0f0f1a; border-radius: 8px; }
+            QTabBar::tab { background-color: #1e1e32; color: #94a3b8;
+                padding: 8px 16px; margin-right: 2px;
+                border-radius: 6px 6px 0 0; }
+            QTabBar::tab:selected { background-color: #0f0f1a;
+                color: white; border-bottom: 2px solid #6366f1; }
+        """)
+
+        tabs.addTab(self._tab_general(), "General")
+        tabs.addTab(self._tab_privacy(), "Privacy")
+        tabs.addTab(self._tab_tor(), "Tor")
+        tabs.addTab(self._tab_tools(), "Tools")
+        tabs.addTab(self._tab_updates(), "🔄 Updates")
+        tabs.addTab(self._tab_about(), "About")
+
+        layout.addWidget(tabs)
+
+        # Bottom buttons
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        save_btn = QPushButton("💾 Save Settings")
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #065f46;
+                color: #d1fae5;
+                border: 1px solid #10b981;
+                padding: 8px 24px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #047857; }
+        """)
+        save_btn.clicked.connect(self.save_settings)
+        btns.addWidget(save_btn)
+
+        reset_btn = QPushButton("🔄 Reset Defaults")
+        reset_btn.clicked.connect(self.reset_defaults)
+        btns.addWidget(reset_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        btns.addWidget(close_btn)
+
+        layout.addLayout(btns)
+        self.setLayout(layout)
+        self.load_current()
+
+    # ---------------- General Tab ----------------
+    def _tab_general(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        g1 = QGroupBox("Homepage & Search")
+        f1 = QFormLayout(g1)
+        self.homepage_edit = QLineEdit()
+        self.homepage_edit.setPlaceholderText("Blank = built-in page")
+        f1.addRow("Homepage:", self.homepage_edit)
+
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(Config.SEARCH_ENGINES.keys())
+        f1.addRow("Search Engine:", self.engine_combo)
         l.addWidget(g1)
 
-        g2 = QGroupBox("JavaScript")
-        v2 = QVBoxLayout()
-        self.js = QCheckBox("Enable JavaScript")
-        self.js.setChecked(True)
-        v2.addWidget(self.js)
-        g2.setLayout(v2)
+        g2 = QGroupBox("User Agent")
+        f2 = QFormLayout(g2)
+        self.ua_combo = QComboBox()
+        self.ua_combo.addItems(Config.USER_AGENTS.keys())
+        f2.addRow("User Agent:", self.ua_combo)
         l.addWidget(g2)
 
-        g3 = QGroupBox("Content")
-        v3 = QVBoxLayout()
-        self.imgs = QCheckBox("Load Images")
-        self.imgs.setChecked(True)
-        v3.addWidget(self.imgs)
-        self.plug = QCheckBox("Enable Plugins")
-        self.plug.setChecked(False)
-        v3.addWidget(self.plug)
-        g3.setLayout(v3)
+        g3 = QGroupBox("Tabs")
+        f3 = QFormLayout(g3)
+        self.max_tabs_spin = QSpinBox()
+        self.max_tabs_spin.setRange(1, 50)
+        self.max_tabs_spin.setValue(Config.MAX_TABS)
+        f3.addRow("Max Tabs:", self.max_tabs_spin)
         l.addWidget(g3)
 
-        g4 = QGroupBox("Tor")
-        v4 = QVBoxLayout()
-        self.tor = QCheckBox("Use Tor Proxy (auto-detect on startup)")
-        self.tor.setChecked(Config.USE_TOR is True)
-        v4.addWidget(self.tor)
-        g4.setLayout(v4)
-        l.addWidget(g4)
+        l.addStretch()
+        return w
 
-        s = QPushButton("Save")
-        s.clicked.connect(self.save)
-        l.addWidget(s)
-        self.setLayout(l)
+    # ---------------- Privacy Tab ----------------
+    def _tab_privacy(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
 
-    def save(self):
-        Config.USE_TOR = self.tor.isChecked()
-        QMessageBox.information(self, "Saved",
-                                "Settings saved. Restart for Tor change.")
-        self.accept()
+        self.adblock_check = QCheckBox("Enable Ad Blocker")
+        self.adblock_check.setChecked(self.browser.adblock_enabled)
+        l.addWidget(self.adblock_check)
 
+        self.https_check = QCheckBox("HTTPS-only mode")
+        self.https_check.setChecked(getattr(self.browser, 'https_only', False))
+        l.addWidget(self.https_check)
 
-# ============================================================
-#  BOOKMARKS / HISTORY DIALOGS
-# ============================================================
-class BookmarksDialog(QDialog):
-    def __init__(self, bookmarks, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Bookmarks")
-        self.setMinimumSize(400, 300)
-        l = QVBoxLayout()
-        lw = QListWidget()
-        for b in bookmarks:
-            lw.addItem(f"{b['title']}  -  {b['url']}")
-        l.addWidget(lw)
-        cb = QDialogButtonBox(QDialogButtonBox.Close)
-        cb.rejected.connect(self.reject)
-        l.addWidget(cb)
-        self.setLayout(l)
+        self.webrtc_check = QCheckBox("Block WebRTC (prevent IP leak)")
+        self.webrtc_check.setChecked(True)
+        l.addWidget(self.webrtc_check)
 
+        self.dns_check = QCheckBox("Disable DNS prefetch")
+        self.dns_check.setChecked(True)
+        l.addWidget(self.dns_check)
 
-class HistoryDialog(QDialog):
-    def __init__(self, history, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("History")
-        self.setMinimumSize(500, 300)
-        l = QVBoxLayout()
-        lw = QListWidget()
-        for h in history:
-            lw.addItem(f"[{h['time']}] {h['title']}  -  {h['url']}")
-        l.addWidget(lw)
-        cb = QDialogButtonBox(QDialogButtonBox.Close)
-        cb.rejected.connect(self.reject)
-        l.addWidget(cb)
-        self.setLayout(l)
+        self.canvas_check = QCheckBox("Canvas fingerprint noise")
+        self.canvas_check.setChecked(True)
+        l.addWidget(self.canvas_check)
+
+        l.addStretch()
+        return w
+
+    # ---------------- Tor Tab ----------------
+    def _tab_tor(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        self.tor_mode_combo = QComboBox()
+        self.tor_mode_combo.addItems(["auto", "always", "never"])
+        self.tor_mode_combo.setCurrentText(
+            "auto" if Config.USE_TOR == "auto"
+            else ("always" if Config.USE_TOR is True else "never"))
+        f = QFormLayout()
+        f.addRow("Tor Mode:", self.tor_mode_combo)
+        l.addLayout(f)
+
+        info = QLabel(
+            "• auto = use Tor if available, else direct\n"
+            "• always = require Tor (error if not running)\n"
+            "• never = always use direct connection"
+        )
+        info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        l.addWidget(info)
+
+        self.tor_socks_edit = QLineEdit(str(Config.TOR_SOCKS_PORT))
+        f2 = QFormLayout()
+        f2.addRow("SOCKS Port:", self.tor_socks_edit)
+        l.addLayout(f2)
+
+        self.tor_autostart_check = QCheckBox("Auto-start Tor (if tor.exe path set)")
+        self.tor_autostart_check.setChecked(Config.TOR_AUTO_START)
+        l.addWidget(self.tor_autostart_check)
+
+        self.tor_exe_edit = QLineEdit(Config.TOR_EXE_PATH)
+        f3 = QFormLayout()
+        f3.addRow("tor.exe Path:", self.tor_exe_edit)
+        l.addLayout(f3)
+
+        # Test button
+        test_btn = QPushButton("🔍 Test Tor Connection")
+        test_btn.clicked.connect(self.test_tor)
+        l.addWidget(test_btn)
+
+        l.addStretch()
+        return w
+
+    # ---------------- Tools Tab ----------------
+    def _tab_tools(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        l.addWidget(QLabel("<b>Dangerous Tools Warning</b>"))
+        self.warn_sql = QCheckBox("Show warning before SQL Scanner")
+        self.warn_sql.setChecked(True)
+        l.addWidget(self.warn_sql)
+
+        self.warn_hash = QCheckBox("Show warning before Hash Cracker")
+        self.warn_hash.setChecked(True)
+        l.addWidget(self.warn_hash)
+
+        self.warn_dark = QCheckBox("Show warning before Dark Web Search")
+        self.warn_dark.setChecked(True)
+        l.addWidget(self.warn_dark)
+
+        self.warn_repeater = QCheckBox("Show warning before Request Repeater")
+        self.warn_repeater.setChecked(True)
+        l.addWidget(self.warn_repeater)
+
+        l.addStretch()
+        return w
+
+    # ---------------- Updates Tab ----------------
+    def _tab_updates(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        # Current version display
+        cur_ver = get_current_version() if UPDATER_AVAILABLE else "N/A"
+        ver_label = QLabel(f"<b>Current Version:</b> {cur_ver}")
+        ver_label.setStyleSheet("font-size: 14px; padding: 8px;")
+        l.addWidget(ver_label)
+
+        # Update status
+        self.update_status = QLabel("Click 'Check for Updates' to check.")
+        self.update_status.setStyleSheet(
+            "color: #94a3b8; padding: 8px; background: #1e1e32; "
+            "border-radius: 6px;")
+        self.update_status.setWordWrap(True)
+        l.addWidget(self.update_status)
+
+        # Progress bar
+        self.update_progress = QProgressBar()
+        self.update_progress.setVisible(False)
+        self.update_progress.setRange(0, 0)  # indeterminate
+        l.addWidget(self.update_progress)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.check_btn = QPushButton("🔍 Check for Updates")
+        self.check_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: white;
+                border: none;
+                padding: 10px 24px;
+                font-weight: bold;
+                border-radius: 8px;
+            }
+            QPushButton:hover { background-color: #2563eb; }
+        """)
+        self.check_btn.clicked.connect(self.check_updates)
+        btn_row.addWidget(self.check_btn)
+
+        self.install_btn = QPushButton("⬇️  Install Update")
+        self.install_btn.setEnabled(False)
+        self.install_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #065f46;
+                color: #d1fae5;
+                border: 1px solid #10b981;
+                padding: 10px 24px;
+                font-weight: bold;
+                border-radius: 8px;
+            }
+            QPushButton:hover:enabled { background-color: #047857; }
+            QPushButton:disabled { background-color: #1e1e32; color: #64748b; }
+        """)
+        self.install_btn.clicked.connect(self.install_update)
+        btn_row.addWidget(self.install_btn)
+
+        btn_row.addStretch()
+
+        cfg_btn = QPushButton("⚙️  Update Config")
+        cfg_btn.clicked.connect(self.open_update_config)
+        btn_row.addWidget(cfg_btn)
+
+        l.addLayout(btn_row)
+
+        # Update info panel (hidden by default)
+        self.update_info_label = QLabel("")
+        self.update_info_label.setStyleSheet(
+            "color: #e2e8f0; background: #1e1e32; padding: 10px; "
+            "border-radius: 6px; border: 1px solid #3f3f5e;")
+        self.update_info_label.setWordWrap(True)
+        self.update_info_label.setVisible(False)
+        l.addWidget(self.update_info_label)
+
+        # Auto-check checkbox
+        self.auto_check_updates = QCheckBox("Automatically check for updates on startup")
+        self.auto_check_updates.setChecked(True)
+        l.addWidget(self.auto_check_updates)
+
+        l.addStretch()
+
+        # Store found update info
+        self.found_update = None
+
+        return w
+
+    # ---------------- About Tab ----------------
+    def _tab_about(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        cur_ver = get_current_version() if UPDATER_AVAILABLE else "5.0.0"
+        about_text = f"""
+        <h2 style="color:#6366f1;">Root Browser v{cur_ver}</h2>
+        <p style="color:#94a3b8;">
+        Feature-rich privacy browser with security tools.<br><br>
+        <b>Repo:</b> github.com/indianinstituteofhacking/rootbrowser<br>
+        <b>Platform:</b> Python 3 + PyQt5 + QtWebEngine<br>
+        <b>Network:</b> Tor (optional)<br>
+        <b>Storage:</b> Local only (SQLite + encrypted)
+        </p>
+        <p style="color:#e11d48; font-size:12px;">
+        ⚠️ For LEGAL security research only.<br>
+        Misuse is illegal under IT Act 2000 and international law.
+        </p>
+        """
+        label = QLabel(about_text)
+        label.setWordWrap(True)
+        label.setOpenExternalLinks(True)
+        l.addWidget(label)
+
+        l.addStretch()
+        return w
+
+    # ---------------- Load / Save ----------------
+    def load_current(self):
+        cfg = load_user_config()
+        self.homepage_edit.setText(cfg.get("homepage", Config.HOMEPAGE))
+        self.engine_combo.setCurrentText(
+            self.browser.current_search_engine)
+        self.ua_combo.setCurrentText(self.browser.current_ua)
+
+    def save_settings(self):
+        # General
+        homepage = self.homepage_edit.text().strip()
+        Config.HOMEPAGE = homepage
+
+        engine = self.engine_combo.currentText()
+        self.browser.current_search_engine = engine
+
+        ua = self.ua_combo.currentText()
+        self.browser.change_ua(ua)
+
+        Config.MAX_TABS = self.max_tabs_spin.value()
+
+        # Privacy
+        self.browser.adblock_enabled = self.adblock_check.isChecked()
+        self.browser.https_only = self.https_check.isChecked()
+        self.browser._apply_block_list()
+
+        # Tor
+        mode = self.tor_mode_combo.currentText()
+        if mode == "auto": Config.USE_TOR = "auto"
+        elif mode == "always": Config.USE_TOR = True
+        else: Config.USE_TOR = False
+
+        try:
+            Config.TOR_SOCKS_PORT = int(self.tor_socks_edit.text())
+        except ValueError:
+            pass
+
+        Config.TOR_AUTO_START = self.tor_autostart_check.isChecked()
+        Config.TOR_EXE_PATH = self.tor_exe_edit.text().strip()
+
+        # Save persistent config
+        save_user_config({
+            "homepage": homepage,
+            "engine": engine,
+            "ua": ua,
+            "max_tabs": Config.MAX_TABS,
+            "adblock": self.browser.adblock_enabled,
+            "https_only": self.browser.https_only,
+            "tor_mode": mode,
+            "tor_socks_port": Config.TOR_SOCKS_PORT,
+            "tor_autostart": Config.TOR_AUTO_START,
+            "tor_exe": Config.TOR_EXE_PATH,
+            "warn_sql": self.warn_sql.isChecked(),
+            "warn_hash": self.warn_hash.isChecked(),
+            "warn_dark": self.warn_dark.isChecked(),
+            "warn_repeater": self.warn_repeater.isChecked(),
+            "auto_check_updates": self.auto_check_updates.isChecked(),
+        })
+
+        QMessageBox.information(
+            self, "Settings Saved",
+            "Settings saved successfully.\n\n"
+            "Some settings (Tor mode, port) require restart.")
+
+    def reset_defaults(self):
+        if QMessageBox.question(
+                self, "Reset",
+                "Reset all settings to defaults?",
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.homepage_edit.setText("")
+            self.engine_combo.setCurrentText("DuckDuckGo")
+            self.ua_combo.setCurrentText("Firefox (Win)")
+            self.max_tabs_spin.setValue(15)
+            self.adblock_check.setChecked(True)
+            self.https_check.setChecked(False)
+            self.webrtc_check.setChecked(True)
+            self.dns_check.setChecked(True)
+            self.canvas_check.setChecked(True)
+            self.tor_mode_combo.setCurrentText("auto")
+            self.tor_socks_edit.setText("9050")
+            self.tor_autostart_check.setChecked(False)
+            self.tor_exe_edit.setText(r"C:\tor\tor.exe")
+            self.warn_sql.setChecked(True)
+            self.warn_hash.setChecked(True)
+            self.warn_dark.setChecked(True)
+            self.warn_repeater.setChecked(True)
+            self.auto_check_updates.setChecked(True)
+
+    def test_tor(self):
+        tor = TorManager()
+        if tor.is_running():
+            ip, is_tor = tor.get_exit_ip()
+            QMessageBox.information(
+                self, "Tor Status",
+                f"✅ Tor is running!\n\n"
+                f"Exit IP: {ip}\nIsTor: {is_tor}")
+        else:
+            QMessageBox.warning(
+                self, "Tor Status",
+                "❌ Tor is not running.\n\n"
+                "Start Tor Browser or tor.exe, then try again.")
+
+    # ---------------- Update Functions ----------------
+    def check_updates(self):
+        if not UPDATER_AVAILABLE:
+            self.update_status.setText(
+                "❌ updater.py not found in folder.")
+            return
+
+        self.check_btn.setEnabled(False)
+        self.update_status.setText("🔄 Checking for updates...")
+        self.update_progress.setVisible(True)
+        self.install_btn.setEnabled(False)
+        self.update_info_label.setVisible(False)
+        self.found_update = None
+
+        # Create checker
+        checker = UpdateChecker()
+
+        def on_found(info):
+            self.update_progress.setVisible(False)
+            self.check_btn.setEnabled(True)
+            self.found_update = info
+            self.update_status.setText(
+                f"✅ Update available: {info['current']} → {info['version']}")
+            self.update_info_label.setText(
+                f"<b>New Version:</b> {info['version']}<br>"
+                f"<b>Release Notes:</b><br>"
+                f"<pre style='white-space:pre-wrap;'>{info.get('notes', 'No notes.')[:800]}</pre>")
+            self.update_info_label.setVisible(True)
+            self.install_btn.setEnabled(True)
+
+        def on_no_update(cur):
+            self.update_progress.setVisible(False)
+            self.check_btn.setEnabled(True)
+            self.update_status.setText(
+                f"✅ You are running the latest version ({cur}).")
+
+        def on_error(err):
+            self.update_progress.setVisible(False)
+            self.check_btn.setEnabled(True)
+            self.update_status.setText(f"❌ {err}")
+
+        checker.update_found.connect(on_found)
+        checker.no_update.connect(on_no_update)
+        checker.error.connect(on_error)
+        checker.start()
+        self._checker = checker  # keep ref
+
+    def install_update(self):
+        if not self.found_update:
+            return
+        # Use the standard UpdateDialog from updater.py
+        try:
+            from updater import UpdateDialog
+            dlg = UpdateDialog(self.found_update, self)
+            dlg.exec_()
+            self.check_updates()  # re-check
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def open_update_config(self):
+        if UPDATER_AVAILABLE:
+            open_updater_config(self)
 # ============================================================
 #  MAIN BROWSER WINDOW
 # ============================================================
 class Browser(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Root Browser v5.0 — Full Featured")
+        cur_ver = get_current_version() if UPDATER_AVAILABLE else "5.0.0"
+        self.setWindowTitle(f"Root Browser v{cur_ver}")
         self.setGeometry(100, 100, 1400, 900)
 
         self.tor_available = Config._TOR_AVAILABLE
         self.current_search_engine = "DuckDuckGo"
         self.current_ua = "Firefox (Win)"
         self.adblock_enabled = True
+        self.https_only = False
         self.security_manager = SecurityManager()
         self.tor = TorManager()
-        self.bookmarks = []
-        self.history = []
+        self.session_manager = SessionManager()
+        self.password_manager = PasswordManager()
 
         self._apply_theme()
 
@@ -1193,6 +1954,29 @@ class Browser(QMainWindow):
         self.tor_timer = QTimer()
         self.tor_timer.timeout.connect(self.renew_tor)
         self.tor_timer.start(600000)
+
+        # Apply saved user config
+        self._apply_saved_config()
+
+    def _apply_saved_config(self):
+        cfg = load_user_config()
+        if not cfg:
+            return
+        try:
+            if cfg.get("engine"):
+                self.current_search_engine = cfg["engine"]
+                self.engine_combo.setCurrentText(cfg["engine"])
+            if cfg.get("ua"):
+                self.current_ua = cfg["ua"]
+                self.change_ua(cfg["ua"])
+                self.ua_combo.setCurrentText(cfg["ua"])
+            if "adblock" in cfg:
+                self.adblock_enabled = cfg["adblock"]
+                self.adblock_btn.setChecked(cfg["adblock"])
+            if "https_only" in cfg:
+                self.https_only = cfg["https_only"]
+        except Exception:
+            pass
 
     def _apply_theme(self):
         p = QPalette()
@@ -1256,7 +2040,8 @@ class Browser(QMainWindow):
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+T"), self, lambda: self.new_tab())
-        QShortcut(QKeySequence("Ctrl+W"), self, lambda: self.close_tab(self.tabs.currentIndex()))
+        QShortcut(QKeySequence("Ctrl+W"), self,
+                  lambda: self.close_tab(self.tabs.currentIndex()))
         QShortcut(QKeySequence("Ctrl+L"), self, lambda: self.url_bar.setFocus())
         QShortcut(QKeySequence("Ctrl+R"), self, self.reload)
         QShortcut(QKeySequence("F5"), self, self.reload)
@@ -1269,6 +2054,7 @@ class Browser(QMainWindow):
         QShortcut(QKeySequence("Ctrl+J"), self, self.open_js_injector)
         QShortcut(QKeySequence("Ctrl+I"), self, self.open_inspector)
         QShortcut(QKeySequence("Ctrl+U"), self, self.view_source)
+        QShortcut(QKeySequence("Ctrl+,"), self, self.open_settings)
 
     def _setup_ui(self):
         tb = QToolBar()
@@ -1324,7 +2110,8 @@ class Browser(QMainWindow):
         tb.addWidget(QLabel("🔒"))
         self.sec_combo = QComboBox()
         self.sec_combo.addItems(SecurityLevel.NAMES.values())
-        self.sec_combo.setCurrentText(SecurityLevel.NAMES[self.security_manager.level])
+        self.sec_combo.setCurrentText(
+            SecurityLevel.NAMES[self.security_manager.level])
         self.sec_combo.currentTextChanged.connect(self.change_security)
         tb.addWidget(self.sec_combo)
 
@@ -1334,22 +2121,29 @@ class Browser(QMainWindow):
         self.ua_combo.currentTextChanged.connect(self.change_ua)
         tb.addWidget(self.ua_combo)
 
-        ad = QPushButton("AdBlock")
-        ad.setCheckable(True)
-        ad.setChecked(True)
-        ad.toggled.connect(self.toggle_adblock)
-        tb.addWidget(ad)
+        self.adblock_btn = QPushButton("AdBlock")
+        self.adblock_btn.setCheckable(True)
+        self.adblock_btn.setChecked(True)
+        self.adblock_btn.toggled.connect(self.toggle_adblock)
+        tb.addWidget(self.adblock_btn)
+
+        settings_btn = QPushButton("⚙️")
+        settings_btn.setToolTip("Settings (Ctrl+,)")
+        settings_btn.clicked.connect(self.open_settings)
+        tb.addWidget(settings_btn)
 
         notes = QPushButton("Notes")
         notes.clicked.connect(self.open_notes)
         tb.addWidget(notes)
 
         panic = QPushButton("PANIC")
-        panic.setStyleSheet("background-color:#e11d48; color:white; "
-                            "font-weight:bold; border-radius:8px; padding:6px 16px;")
+        panic.setStyleSheet(
+            "background-color:#e11d48; color:white; "
+            "font-weight:bold; border-radius:8px; padding:6px 16px;")
         panic.clicked.connect(self.panic)
         tb.addWidget(panic)
 
+        # Menu bar
         mb = self.menuBar()
         mb.setStyleSheet("""
             QMenuBar { background-color: #1e1e32; color: #e2e8f0;
@@ -1360,13 +2154,17 @@ class Browser(QMainWindow):
 
         fm = mb.addMenu("File")
         fm.addAction("New Tab", lambda: self.new_tab(), "Ctrl+T")
+        fm.addAction("Settings", self.open_settings, "Ctrl+,")
         fm.addSeparator()
         fm.addAction("Exit", self.close, "Ctrl+Q")
 
         em = mb.addMenu("Edit")
-        em.addAction("Copy URL", lambda: QApplication.clipboard().setText(self.url_bar.text()))
+        em.addAction("Copy URL",
+                     lambda: QApplication.clipboard().setText(
+                         self.url_bar.text()))
         em.addAction("Bookmarks", self.show_bookmarks, "Ctrl+B")
         em.addAction("History", self.show_history, "Ctrl+H")
+        em.addAction("Password Manager", self.open_password_manager)
 
         vm = mb.addMenu("View")
         vm.addAction("View Source", self.view_source, "Ctrl+U")
@@ -1376,7 +2174,6 @@ class Browser(QMainWindow):
 
         sm = mb.addMenu("Security")
         sm.addAction("Certificate Viewer", self.open_cert)
-        sm.addAction("Security Settings", self.open_sec_settings)
         sm.addAction("Cookie Editor", self.open_cookies)
         sm.addAction("Tor Circuits", self.show_circuits)
         sm.addAction("Renew Tor Circuit", self.renew_tor)
@@ -1392,14 +2189,11 @@ class Browser(QMainWindow):
         tm.addAction("Python Console", self.open_py_console, "Ctrl+P")
 
         hm = mb.addMenu("Help")
-        hm.addAction("⚖️ License & Legal Disclaimer", self.show_license_dialog)
-        hm.addAction("About", lambda: QMessageBox.about(
-            self, "Root Browser v5.0",
-            "Root Browser v5.0 - Full Featured\n\n"
-            "Tor (auto) · Anti-Fingerprint · Hash Cracker · SQL Scanner\n"
-            "Request Repeater · DOM Manipulator · Dark Search\n"
-            "Cert Viewer · JS/Python Console · Cookie Editor · etc.\n\n"
-            "⚠️ For legal security research only."))
+        hm.addAction("🚀 Check for Updates", self.check_updates)
+        hm.addAction("⚙️  Updater Config", self.open_updater_config)
+        hm.addSeparator()
+        hm.addAction("⚖️  License & Legal Disclaimer", self.show_license_dialog)
+        hm.addAction("ℹ️  About", self.show_about)
 
         central = QWidget()
         cl = QVBoxLayout(central)
@@ -1416,7 +2210,8 @@ class Browser(QMainWindow):
     # ---------- Tabs ----------
     def new_tab(self, url=None):
         if self.tabs.count() >= Config.MAX_TABS:
-            QMessageBox.warning(self, "Limit", f"Max {Config.MAX_TABS} tabs.")
+            QMessageBox.warning(self, "Limit",
+                                f"Max {Config.MAX_TABS} tabs.")
             return
         v = QWebEngineView()
         p = QWebEnginePage(self.profile, v)
@@ -1436,15 +2231,19 @@ class Browser(QMainWindow):
         s.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, False)
 
         v.setContextMenuPolicy(Qt.CustomContextMenu)
-        v.customContextMenuRequested.connect(lambda pos, vv=v: self.page_menu(vv, pos))
+        v.customContextMenuRequested.connect(
+            lambda pos, vv=v: self.page_menu(vv, pos))
         v.urlChanged.connect(lambda u, vv=v: self.on_url(vv, u))
         v.titleChanged.connect(lambda t, vv=v: self.on_title(vv, t))
         v.loadProgress.connect(lambda pr, vv=v: self.on_progress(vv, pr))
 
         idx = self.tabs.addTab(v, "New Tab")
         self.tabs.setCurrentIndex(idx)
+
         if url:
             v.setUrl(QUrl(url))
+        elif Config.HOMEPAGE:
+            v.setUrl(QUrl(Config.HOMEPAGE))
         else:
             v.setHtml(self._home_html())
         return v
@@ -1453,7 +2252,8 @@ class Browser(QMainWindow):
         if self.tabs.count() > 1:
             w = self.tabs.widget(idx)
             self.tabs.removeTab(idx)
-            if w: w.deleteLater()
+            if w:
+                w.deleteLater()
 
     def on_tab_changed(self, i):
         w = self.tabs.widget(i)
@@ -1470,9 +2270,7 @@ class Browser(QMainWindow):
             self.url_bar.setText(u.toString())
             self.status_bar.showMessage(f"Loaded: {u.toString()}", 3000)
         try:
-            if v.title():
-                self.history.append({"title": v.title(), "url": u.toString(),
-                                     "time": datetime.now().strftime("%H:%M:%S")})
+            self.session_manager.add_history(u.toString(), v.title() or "")
         except Exception:
             pass
 
@@ -1491,9 +2289,11 @@ class Browser(QMainWindow):
 
     def navigate(self):
         t = self.url_bar.text().strip()
-        if not t: return
+        if not t:
+            return
         w = self._cur()
-        if not w: return
+        if not w:
+            return
         is_url = (' ' not in t) and (
             t.startswith(('http://', 'https://', 'about:', 'file://')) or
             ('.' in t and not t.startswith(('?', '#'))))
@@ -1502,8 +2302,9 @@ class Browser(QMainWindow):
                 t = 'https://' + t
             w.setUrl(QUrl(t))
         else:
-            e = Config.SEARCH_ENGINES.get(self.current_search_engine,
-                                          Config.SEARCH_ENGINES["DuckDuckGo"])
+            e = Config.SEARCH_ENGINES.get(
+                self.current_search_engine,
+                Config.SEARCH_ENGINES["DuckDuckGo"])
             w.setUrl(QUrl(e.format(quote(t))))
 
     def back(self):
@@ -1520,7 +2321,11 @@ class Browser(QMainWindow):
 
     def home(self):
         w = self._cur()
-        if w: w.setHtml(self._home_html())
+        if w:
+            if Config.HOMEPAGE:
+                w.setUrl(QUrl(Config.HOMEPAGE))
+            else:
+                w.setHtml(self._home_html())
 
     def change_engine(self, n):
         self.current_search_engine = n
@@ -1565,7 +2370,8 @@ class Browser(QMainWindow):
     def show_circuits(self):
         cs = self.tor.get_circuits()
         if not cs:
-            QMessageBox.information(self, "Circuits", "No info. Need stem + Tor.")
+            QMessageBox.information(self, "Circuits",
+                                    "No info. Need stem + Tor.")
             return
         QMessageBox.information(self, "Circuits",
                                 "\n".join(f"{c.id} {c.status}" for c in cs))
@@ -1573,11 +2379,26 @@ class Browser(QMainWindow):
     def show_license_dialog(self):
         show_license(self)
 
+    def show_about(self):
+        cur_ver = get_current_version() if UPDATER_AVAILABLE else "5.0.0"
+        QMessageBox.about(
+            self, "About Root Browser",
+            f"<h3>Root Browser v{cur_ver}</h3>"
+            f"<p>Feature-rich privacy browser with security tools.</p>"
+            f"<p><b>Repo:</b> "
+            f"github.com/indianinstituteofhacking/rootbrowser</p>"
+            f"<p><b>Tor:</b> optional / auto-detect</p>"
+            f"<p><b>Storage:</b> Local only</p>"
+            f"<p style='color:#e11d48;'>"
+            f"⚠️ For legal security research only.</p>")
+
     # ---------- Home HTML ----------
     def _home_html(self):
-        e = Config.SEARCH_ENGINES.get(self.current_search_engine,
-                                      Config.SEARCH_ENGINES["DuckDuckGo"])
+        e = Config.SEARCH_ENGINES.get(
+            self.current_search_engine,
+            Config.SEARCH_ENGINES["DuckDuckGo"])
         mode = "🟢 Tor Mode" if Config.USE_TOR else "🟡 Direct Mode"
+        cur_ver = get_current_version() if UPDATER_AVAILABLE else "5.0.0"
         return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>New Tab</title>
 <style>
@@ -1599,7 +2420,7 @@ color:white;border:none;border-radius:30px;font-size:16px;cursor:pointer;
 font-weight:bold;}}
 </style></head><body>
 <div class="c">
-<h2>Root Browser v5.0</h2>
+<h2>Root Browser v{cur_ver}</h2>
 <div class="badge">{mode}</div>
 <p>Search or type a URL</p>
 <div class="s">
@@ -1625,7 +2446,8 @@ if(e.key==='Enter')go();}});
         m.addSeparator()
         m.addAction("Copy", lambda: v.page().triggerAction(QWebEnginePage.Copy))
         m.addAction("Paste", lambda: v.page().triggerAction(QWebEnginePage.Paste))
-        m.addAction("Select All", lambda: v.page().triggerAction(QWebEnginePage.SelectAll))
+        m.addAction("Select All",
+                    lambda: v.page().triggerAction(QWebEnginePage.SelectAll))
         m.addSeparator()
         m.addAction("🔍 Copy as cURL", lambda: self.copy_curl(v))
         m.addAction("🔐 Hash Cracker", self.open_hash)
@@ -1637,6 +2459,7 @@ if(e.key==='Enter')go();}});
         m.addAction("🍪 View Cookies", lambda: self.show_cookies(v))
         m.addAction("📷 Screenshot", lambda: self.screenshot(v))
         m.addAction("💾 Save Page As HTML", lambda: self.save_page(v))
+        m.addAction("⭐ Bookmark this page", lambda: self.bookmark_page(v))
         m.addSeparator()
         m.addAction("🔗 Extract All Links", lambda: self.extract_links(v))
         m.addAction("🖼 Extract All Images", lambda: self.extract_images(v))
@@ -1644,9 +2467,11 @@ if(e.key==='Enter')go();}});
         m.addSeparator()
         host = v.url().host()
         if host and host in self.interceptor.blocked_hosts:
-            m.addAction("🔓 Unblock This Domain", lambda: self.unblock_host(host))
+            m.addAction("🔓 Unblock This Domain",
+                        lambda: self.unblock_host(host))
         else:
-            m.addAction("🚫 Block This Domain", lambda: self.block_host(host))
+            m.addAction("🚫 Block This Domain",
+                        lambda: self.block_host(host))
         m.addAction("🤖 Check robots.txt", lambda: self.open_robots(v))
         m.addAction("🌍 Open in System Browser",
                     lambda: webbrowser.open(v.url().toString()))
@@ -1657,7 +2482,8 @@ if(e.key==='Enter')go();}});
         m.addSeparator()
         m.addAction("🔧 Inspect Element",
                     lambda: self.open_inspector_for(v.page()))
-        m.addAction("➕ Open in New Tab", lambda: self.new_tab(v.url().toString()))
+        m.addAction("➕ Open in New Tab",
+                    lambda: self.new_tab(v.url().toString()))
         m.addSeparator()
         m.addAction("⚖️  License & Legal Disclaimer", self.show_license_dialog)
         m.exec_(v.mapToGlobal(pos))
@@ -1666,7 +2492,8 @@ if(e.key==='Enter')go();}});
         m = QMenu()
         m.addAction("New Tab", lambda: self.new_tab())
         m.addAction("Reload", self.reload)
-        m.addAction("Close Tab", lambda: self.close_tab(self.tabs.currentIndex()))
+        m.addAction("Close Tab",
+                    lambda: self.close_tab(self.tabs.currentIndex()))
         m.addSeparator()
         m.addAction("⚖️  License & Legal Disclaimer", self.show_license_dialog)
         m.exec_(self.tabs.mapToGlobal(pos))
@@ -1675,20 +2502,23 @@ if(e.key==='Enter')go();}});
     def copy_curl(self, v):
         u = v.url().toString()
         ua = self.profile.httpUserAgent()
-        if Config.USE_TOR:
-            c = f'curl -x socks5h://127.0.0.1:{Config.TOR_SOCKS_PORT} -H "User-Agent: {ua}" "{u}"'
+        if Config.USE_TOR is True or Config._TOR_AVAILABLE:
+            c = (f'curl -x socks5h://127.0.0.1:{Config.TOR_SOCKS_PORT} '
+                 f'-H "User-Agent: {ua}" "{u}"')
         else:
             c = f'curl -H "User-Agent: {ua}" "{u}"'
         QApplication.clipboard().setText(c)
         self.status_bar.showMessage("cURL copied", 3000)
 
     def show_cookies(self, v):
-        v.page().runJavaScript("document.cookie",
-                               lambda c: self._text_dialog("Cookies", c or "No cookies"))
+        v.page().runJavaScript(
+            "document.cookie",
+            lambda c: self._text_dialog("Cookies", c or "No cookies"))
 
     def screenshot(self, v):
         p = v.grab()
-        path, _ = QFileDialog.getSaveFileName(self, "Save", "screenshot.png", "PNG (*.png)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save",
+                                              "screenshot.png", "PNG (*.png)")
         if path:
             p.save(path)
             self.status_bar.showMessage(f"Saved: {path}", 3000)
@@ -1697,11 +2527,20 @@ if(e.key==='Enter')go();}});
         v.page().toHtml(self._save_html)
 
     def _save_html(self, h):
-        path, _ = QFileDialog.getSaveFileName(self, "Save", "page.html", "HTML (*.html)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save",
+                                              "page.html", "HTML (*.html)")
         if path:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(h)
             self.status_bar.showMessage(f"Saved: {path}", 3000)
+
+    def bookmark_page(self, v):
+        try:
+            self.session_manager.add_bookmark(
+                v.url().toString(), v.title() or "")
+            self.status_bar.showMessage("Bookmarked!", 3000)
+        except Exception as e:
+            QMessageBox.warning(self, "Bookmark", str(e))
 
     def extract_links(self, v):
         v.page().runJavaScript(
@@ -1718,7 +2557,8 @@ if(e.key==='Enter')go();}});
 
     def _extract_comments(self, h):
         c = re.findall(r'<!--(.*?)-->', h, re.DOTALL)
-        self._text_dialog("HTML Comments", "\n\n".join(c) if c else "None")
+        self._text_dialog("HTML Comments",
+                          "\n\n".join(c) if c else "None")
 
     def block_host(self, h):
         if h and h not in self.interceptor.blocked_hosts:
@@ -1751,20 +2591,22 @@ if(e.key==='Enter')go();}});
     def _save_wordlist(self, text):
         if not text: return
         words = sorted(set(re.findall(r'\b\w+\b', text.lower())))
-        p, _ = QFileDialog.getSaveFileName(self, "Save Wordlist", "wordlist.txt", "*.txt")
+        p, _ = QFileDialog.getSaveFileName(self, "Save Wordlist",
+                                           "wordlist.txt", "*.txt")
         if p:
             with open(p, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(words))
-            self.status_bar.showMessage(f"Wordlist saved ({len(words)})", 4000)
+            self.status_bar.showMessage(
+                f"Wordlist saved ({len(words)})", 4000)
 
     def toggle_dark(self, v):
         css = ("html{filter:invert(1) hue-rotate(180deg)!important;"
                "background:#000!important;}"
                "img,video,canvas,iframe,embed{"
                "filter:invert(1) hue-rotate(180deg)!important;}")
-        js = f"var s=document.getElementById('dm');if(s){{s.remove();}}else{{" \
-             f"var e=document.createElement('style');e.id='dm';" \
-             f"e.textContent=`{css}`;document.head.appendChild(e);}}"
+        js = (f"var s=document.getElementById('dm');if(s){{s.remove();}}else{{"
+              f"var e=document.createElement('style');e.id='dm';"
+              f"e.textContent=`{css}`;document.head.appendChild(e);}}")
         v.page().runJavaScript(js)
 
     def view_source(self):
@@ -1787,14 +2629,20 @@ if(e.key==='Enter')go();}});
             self.devtools.append(d)
 
     def open_hash(self):
+        if LICENSE_AVAILABLE and not warning_hash_cracker(self):
+            return
         HashCrackerDialog(self).exec_()
 
     def open_sql(self):
+        if LICENSE_AVAILABLE and not warning_sql_scanner(self):
+            return
         v = self._cur()
         u = v.url().toString() if v else ""
         SqlScannerDialog(u, self).exec_()
 
     def open_repeater(self):
+        if LICENSE_AVAILABLE and not warning_request_repeater(self):
+            return
         RequestRepeaterDialog(self).exec_()
 
     def open_dom(self, v=None):
@@ -1804,15 +2652,14 @@ if(e.key==='Enter')go();}});
             DomDialog(v.page(), self).exec_()
 
     def open_dark(self):
+        if LICENSE_AVAILABLE and not warning_dark_search(self):
+            return
         DarkSearchDialog(self, self).exec_()
 
     def open_cert(self):
         v = self._cur()
         h = v.url().host() if v else ""
         CertDialog(h, self).exec_()
-
-    def open_sec_settings(self):
-        SecuritySettingsDialog(self, self).exec_()
 
     def open_cookies(self):
         CookieEditor(self.profile, self).exec_()
@@ -1828,12 +2675,32 @@ if(e.key==='Enter')go();}});
         self.pyc = PyConsole(self)
         self.pyc.show()
 
+    def open_settings(self):
+        SettingsDialog(self, self).exec_()
+
+    def open_password_manager(self):
+        PasswordManagerDialog(self.password_manager, self).exec_()
+
     def show_bookmarks(self):
-        BookmarksDialog(self.bookmarks, self).exec_()
+        BookmarksDialog(self.session_manager, self).exec_()
 
     def show_history(self):
-        HistoryDialog(self.history, self).exec_()
+        HistoryDialog(self.session_manager, self).exec_()
 
+    # ---------- Update methods ----------
+    def check_updates(self):
+        if UPDATER_AVAILABLE:
+            self.status_bar.showMessage("Checking for updates...", 3000)
+            check_for_updates_manual(self)
+        else:
+            QMessageBox.information(self, "Updater",
+                                    "updater.py not found.")
+
+    def open_updater_config(self):
+        if UPDATER_AVAILABLE:
+            open_updater_config(self)
+
+    # ---------- Notes ----------
     def open_notes(self):
         d = QDialog(self)
         d.setWindowTitle("Notes")
@@ -1883,7 +2750,8 @@ if(e.key==='Enter')go();}});
 
     def on_download(self, dl: QWebEngineDownloadItem):
         try:
-            p, _ = QFileDialog.getSaveFileName(self, "Save", dl.path() or dl.downloadFileName())
+            p, _ = QFileDialog.getSaveFileName(
+                self, "Save", dl.path() or dl.downloadFileName())
             if p:
                 dl.setPath(p)
                 dl.accept()
@@ -1897,28 +2765,32 @@ if(e.key==='Enter')go();}});
 
 
 # ============================================================
-#  SMART TOR DETECTION
+#  TOR DETECTION
 # ============================================================
 def _detect_tor_mode():
-    """Return (use_tor: bool, tor_available: bool, message: str)"""
     tor = TorManager()
 
-    if Config.USE_TOR is True:
+    mode = Config.USE_TOR
+    # Load user config override
+    cfg = load_user_config()
+    if "tor_mode" in cfg:
+        mode = cfg["tor_mode"]
+
+    if mode == "never" or mode is False:
+        return False, False, "Tor disabled"
+    if mode == "always" or mode is True:
         if tor.is_running():
-            return True, True, "Tor detected (forced mode)"
+            return True, True, "Tor detected"
         if Config.TOR_AUTO_START and tor.start_tor():
             return True, True, "Tor auto-started"
-        return True, False, "Tor not found (USE_TOR=True, will error)"
+        return True, False, "Tor NOT running (forced mode)"
 
-    if Config.USE_TOR is False:
-        return False, False, "Tor disabled by user"
-
-    # "auto"
+    # auto
     if tor.is_running():
-        return True, True, "Tor detected — using Tor"
+        return True, True, "Tor detected (auto)"
     if Config.TOR_AUTO_START and tor.start_tor():
-        return True, True, "Tor auto-started"
-    return False, False, "Tor not found — using direct connection"
+        return True, True, "Tor auto-started (auto)"
+    return False, False, "Tor not found — direct mode"
 
 
 # ============================================================
@@ -1926,33 +2798,36 @@ def _detect_tor_mode():
 # ============================================================
 def main():
     print("╔══════════════════════════════════════════════╗")
-    print("║   ROOT BROWSER v5.0 — Smart Tor Mode        ║")
+    print("║   ROOT BROWSER v6.0 — Smart Tor + Updates   ║")
     print("╚══════════════════════════════════════════════╝")
 
-    use_tor, tor_available, message = _detect_tor_mode()
-    print(f"[*] {message}")
+    # Load saved config
+    cfg = load_user_config()
+
+    use_tor, tor_avail, msg = _detect_tor_mode()
+    print(f"[*] {msg}")
 
     if use_tor:
         os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
-            f'--proxy-server=socks5://127.0.0.1:{Config.TOR_SOCKS_PORT}'
-        )
-        print(f"[✓] Proxy set to Tor SOCKS5 (127.0.0.1:{Config.TOR_SOCKS_PORT})")
+            f'--proxy-server=socks5://127.0.0.1:{Config.TOR_SOCKS_PORT}')
+        print(f"[✓] Proxy → Tor SOCKS5")
     else:
         os.environ.pop('QTWEBENGINE_CHROMIUM_FLAGS', None)
-        print("[✓] No proxy — direct connection")
+        print("[✓] Direct connection")
 
     Config.USE_TOR = use_tor
-    Config._TOR_AVAILABLE = tor_available
+    Config._TOR_AVAILABLE = tor_avail
 
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
 
-    # License acceptance (first run only)
+    # License acceptance
     if LICENSE_AVAILABLE:
-        flag = os.path.join(os.path.expanduser("~"), ".root_browser_agreed")
+        flag = os.path.join(os.path.expanduser("~"),
+                            ".root_browser_agreed")
         if not os.path.exists(flag):
             if not request_acceptance():
-                print("[!] License not accepted. Exiting.")
+                print("[!] License not accepted.")
                 sys.exit(0)
             try:
                 with open(flag, 'w', encoding='utf-8') as f:
@@ -1960,20 +2835,24 @@ def main():
             except Exception:
                 pass
 
-    # Verify Tor exit IP
-    if use_tor and tor_available:
+    # Tor exit IP verify
+    if use_tor and tor_avail:
         try:
             tor = TorManager()
             ip, is_tor = tor.get_exit_ip()
             if ip:
                 print(f"[✓] Exit IP: {ip}  IsTor: {is_tor}")
-            else:
-                print("[!] Could not fetch exit IP")
-        except Exception as e:
-            print(f"[!] Exit IP check failed: {e}")
+        except Exception:
+            pass
 
     w = Browser()
     w.show()
+
+    # Auto-check for updates (if enabled in config)
+    auto_check = cfg.get("auto_check_updates", True)
+    if UPDATER_AVAILABLE and auto_check:
+        QTimer.singleShot(3000, lambda: check_for_updates(w, silent=True))
+
     sys.exit(app.exec_())
 
 
